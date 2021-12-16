@@ -2,9 +2,13 @@ package reddit
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 
 	"github.com/vartanbeno/go-reddit/v2/reddit"
@@ -12,6 +16,7 @@ import (
 
 type Reddit struct {
 	client *reddit.Client
+	hashes map[string]bool
 }
 
 func New(clientID string, clientSecret string, username string, password string) (*Reddit, error) {
@@ -29,6 +34,7 @@ func New(clientID string, clientSecret string, username string, password string)
 
 	return &Reddit{
 		client: client,
+		hashes: make(map[string]bool),
 	}, nil
 }
 
@@ -40,6 +46,7 @@ func NewReadonly() (*Reddit, error) {
 
 	return &Reddit{
 		client: client,
+		hashes: make(map[string]bool),
 	}, nil
 }
 
@@ -115,10 +122,8 @@ func (r *Reddit) GetURLsFromSubreddit(ctx context.Context, subreddit string) cha
 }
 
 func (r *Reddit) Download(ctx context.Context, dirname string, urls chan string) error {
-	if _, err := os.Stat(dirname); errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(dirname, 0666); err != nil {
-			return err
-		}
+	if err := mkdirIfNotExist(dirname); err != nil {
+		return err
 	}
 
 	uniqueURLs := make(map[string]bool)
@@ -133,10 +138,27 @@ func (r *Reddit) Download(ctx context.Context, dirname string, urls chan string)
 			continue
 		}
 
-		err := r.downloadURL(ctx, dirname, url)
+		results, err := r.downloadURL(ctx, url)
 		if err != nil {
 			fmt.Println(err)
 			continue
+		}
+
+		newDir := dirname
+		if len(results) > 1 {
+			newDir = fmt.Sprintf("%s/%s", dirname, filepath.Base(url))
+
+			if err := mkdirIfNotExist(newDir); err != nil {
+				return nil
+			}
+		}
+
+		for _, result := range results {
+			filepath := fmt.Sprintf("%s/%s", newDir, result.file)
+			if err := r.saveFile(ctx, result.rc, filepath); err != nil {
+				fmt.Println(err)
+				continue
+			}
 		}
 
 		uniqueURLs[url] = true
@@ -151,18 +173,84 @@ var (
 	imgurRx   = regexp.MustCompile(`^https?://i.imgur.com/([a-zA-Z0-9]+).*$`)
 )
 
-func (r *Reddit) downloadURL(ctx context.Context, dirpath string, URL string) error {
+type downloadResult struct {
+	rc   io.ReadCloser
+	file string
+}
+
+func (r *Reddit) downloadURL(ctx context.Context, URL string) ([]*downloadResult, error) {
 	if redgifsRx.Match([]byte(URL)) {
-		return downloadRedgifsURL(ctx, dirpath, URL)
+		return downloadRedgifsURL(ctx, URL)
 	}
 
 	if galleryRx.Match([]byte(URL)) {
-		return downloadGalleryURL(ctx, r.client, dirpath, URL)
+		return downloadGalleryURL(ctx, r.client, URL)
 	}
 
 	if imgurRx.Match([]byte(URL)) {
-		return downloadImgurURL(ctx, dirpath, URL)
+		return downloadImgurURL(ctx, URL)
 	}
 
-	return downloadURL(ctx, dirpath, URL)
+	result, err := downloadURL(ctx, URL)
+	if err != nil {
+		return nil, err
+	}
+
+	return []*downloadResult{result}, nil
+}
+
+type readerFunc func(p []byte) (n int, err error)
+
+func (rf readerFunc) Read(p []byte) (n int, err error) {
+	return rf(p)
+}
+
+var errDuplicatedFiles = errors.New("duplicated files")
+
+func (r *Reddit) saveFile(ctx context.Context, rc io.ReadCloser, filepath string) error {
+	defer rc.Close()
+
+	_, err := os.Stat(filepath)
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	out, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		out.Close()
+
+		if errors.Is(err, errDuplicatedFiles) {
+			os.Remove(filepath)
+		}
+	}()
+
+	hasher := md5.New()
+	reader := io.TeeReader(rc, hasher)
+
+	_, err = io.Copy(out, readerFunc(func(b []byte) (int, error) {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+		}
+
+		n, err := reader.Read(b)
+		if err != nil {
+			return 0, err
+		}
+
+		hash := hex.EncodeToString(hasher.Sum(nil))
+		if r.hashes[hash] {
+			return 0, errDuplicatedFiles
+		}
+
+		r.hashes[hash] = true
+		return n, err
+	}))
+
+	return err
 }

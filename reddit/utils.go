@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -16,6 +15,16 @@ import (
 	"github.com/vartanbeno/go-reddit/v2/reddit"
 	"golang.org/x/net/html/charset"
 )
+
+func mkdirIfNotExist(dirname string) error {
+	if _, err := os.Stat(dirname); errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(dirname, 0666); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
 
 func getRedgifsURL(URL string) (string, error) {
 	resp, err := soup.Get(URL)
@@ -135,96 +144,86 @@ func convertFromPreviewURL(URL string) (string, error) {
 	return res.String(), nil
 }
 
-func downloadRedgifsURL(ctx context.Context, dirpath string, URL string) error {
-	url, err := getRedgifsURL(URL)
+func downloadRedgifsURL(ctx context.Context, URL string) ([]*downloadResult, error) {
+	redgifsURL, err := getRedgifsURL(URL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return downloadURL(ctx, dirpath, url)
+	result, err := downloadURL(ctx, redgifsURL)
+	if err != nil {
+		return nil, err
+	}
+
+	return []*downloadResult{result}, nil
 }
 
-func downloadGalleryURL(ctx context.Context, client *reddit.Client, dirpath string, URL string) error {
+func downloadGalleryURL(ctx context.Context, client *reddit.Client, URL string) ([]*downloadResult, error) {
 	urls, err := getGalleryURLs(client, URL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	newDirpath := fmt.Sprintf("%s/%s", dirpath, filepath.Base(URL))
-
-	if _, err := os.Stat(newDirpath); errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(newDirpath, 0666); err != nil {
-			return err
-		}
-	}
-
+	results := make([]*downloadResult, 0)
 	for _, url := range urls {
-		err := downloadURL(ctx, newDirpath, url)
+		result, err := downloadURL(ctx, url)
 		if err != nil {
-			return err
+			return nil, err
 		}
+
+		results = append(results, result)
 	}
 
-	return nil
+	return results, nil
 }
 
-func downloadImgurURL(ctx context.Context, dirpath string, URL string) error {
+func downloadImgurURL(ctx context.Context, URL string) ([]*downloadResult, error) {
 	base := filepath.Base(URL)
-	if strings.HasSuffix(base, ".jpg") || strings.HasSuffix(base, ".png") {
-		return downloadURL(ctx, dirpath, URL)
+	if strings.HasSuffix(base, ".jpg") || strings.HasSuffix(base, ".jpeg") || strings.HasSuffix(base, ".png") {
+		result, err := downloadURL(ctx, URL)
+		if err != nil {
+			return nil, err
+		}
+
+		return []*downloadResult{result}, nil
 	}
 
-	url, err := getImgurURL(URL)
+	imgurURL, err := getImgurURL(URL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return downloadURL(ctx, dirpath, url)
+	result, err := downloadURL(ctx, imgurURL)
+	if err != nil {
+		return nil, err
+	}
+
+	return []*downloadResult{result}, nil
 }
 
-type readerFunc func(p []byte) (n int, err error)
-
-func (rf readerFunc) Read(p []byte) (n int, err error) {
-	return rf(p)
-}
-
-func downloadURL(ctx context.Context, dirpath string, URL string) error {
+func downloadURL(ctx context.Context, URL string) (*downloadResult, error) {
 	fmt.Printf("Downloading '%s'...\n", URL)
 
-	resp, err := http.Get(URL)
+	client := http.DefaultClient
+
+	req, err := http.NewRequest(http.MethodGet, URL, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	defer resp.Body.Close()
+	req = req.WithContext(ctx)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("got wrong status %s", resp.Status)
+		return nil, fmt.Errorf("got wrong status %s", resp.Status)
 	}
 
-	filepath := fmt.Sprintf("%s/%s", dirpath, filepath.Base(URL))
-
-	if _, err := os.Stat(filepath); errors.Is(err, os.ErrNotExist) {
-		out, err := os.Create(filepath)
-		if err != nil {
-			return err
-		}
-
-		defer out.Close()
-
-		_, err = io.Copy(out, readerFunc(func(b []byte) (int, error) {
-			select {
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			default:
-				return resp.Body.Read(b)
-			}
-		}))
-
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return &downloadResult{
+		rc:   resp.Body,
+		file: filepath.Base(URL),
+	}, nil
 }
